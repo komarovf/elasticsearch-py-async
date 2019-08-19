@@ -1,18 +1,19 @@
 import asyncio
 
 import aiohttp
-from aiohttp.errors import FingerprintMismatch, ClientError
+import async_timeout
+from aiohttp import ClientTimeout
+from aiohttp.client_exceptions import ServerFingerprintMismatch, ClientError
 
 from elasticsearch.exceptions import ConnectionError, ConnectionTimeout, SSLError
 from elasticsearch.connection import Connection
 from elasticsearch.compat import urlencode
 
-from .helpers import ensure_future
 
 class AIOHttpConnection(Connection):
     def __init__(self, host='localhost', port=9200, http_auth=None,
             use_ssl=False, verify_certs=False, ca_certs=None, client_cert=None,
-            client_key=None, loop=None, use_dns_cache=True, **kwargs):
+            client_key=None, loop=None, use_dns_cache=True, headers=None, **kwargs):
         super().__init__(host=host, port=port, **kwargs)
 
         self.loop = asyncio.get_event_loop() if loop is None else loop
@@ -24,14 +25,18 @@ class AIOHttpConnection(Connection):
             if isinstance(http_auth, (tuple, list)):
                 http_auth = aiohttp.BasicAuth(*http_auth)
 
+        headers = headers or {}
+        headers.setdefault('content-type', 'application/json')
+
         self.session = aiohttp.ClientSession(
             auth=http_auth,
+            timeout=ClientTimeout(total=self.timeout),
             connector=aiohttp.TCPConnector(
                 loop=self.loop,
-                verify_ssl=verify_certs,
-                conn_timeout=self.timeout,
+                ssl=verify_certs,
                 use_dns_cache=use_dns_cache,
-            )
+            ),
+            headers=headers
         )
 
         self.base_url = 'http%s://%s:%d%s' % (
@@ -39,11 +44,12 @@ class AIOHttpConnection(Connection):
             host, port, self.url_prefix
         )
 
-    def close(self):
-        return ensure_future(self.session.close())
-
     @asyncio.coroutine
-    def perform_request(self, method, url, params=None, body=None, timeout=None, ignore=()):
+    def close(self):
+        yield from self.session.close()
+
+    async def perform_request(self, method, url, params=None, body=None,
+                              timeout=None, ignore=(), headers=None):
         url_path = url
         if params:
             url_path = '%s?%s' % (url, urlencode(params or {}))
@@ -52,26 +58,36 @@ class AIOHttpConnection(Connection):
         start = self.loop.time()
         response = None
         try:
-            with aiohttp.Timeout(timeout or self.timeout):
-                response = yield from self.session.request(method, url, data=body)
-                raw_data = yield from response.text()
+            async with async_timeout.timeout(
+                    timeout or self.timeout, loop=self.loop
+            ):
+                response = await self.session.request(
+                    method, url, data=body, headers=headers
+                )
+                raw_data = await response.text()
             duration = self.loop.time() - start
 
+        except asyncio.CancelledError:
+            raise
+
         except asyncio.TimeoutError as e:
-            self.log_request_fail(method, url, body, self.loop.time() - start, exception=e)
+            self.log_request_fail(method, url, body, self.loop.time() - start,
+                                  exception=e)
             raise ConnectionTimeout('TIMEOUT', str(e), e)
 
-        except FingerprintMismatch as e:
-            self.log_request_fail(method, url, body, self.loop.time() - start, exception=e)
+        except ServerFingerprintMismatch as e:
+            self.log_request_fail(method, url, body, self.loop.time() - start,
+                                  exception=e)
             raise SSLError('N/A', str(e), e)
 
         except ClientError as e:
-            self.log_request_fail(method, url, body, self.loop.time() - start, exception=e)
+            self.log_request_fail(method, url, body, self.loop.time() - start,
+                                  exception=e)
             raise ConnectionError('N/A', str(e), e)
 
         finally:
             if response is not None:
-                yield from response.release()
+                await response.release()
 
         # raise errors based on http status codes, let the client handle those if needed
         if not (200 <= response.status < 300) and response.status not in ignore:
